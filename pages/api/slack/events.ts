@@ -23,6 +23,116 @@ function getRawBody(req: NextApiRequest): Promise<string> {
   });
 }
 
+// Dify APIを呼び出す関数
+async function callDifyWorkflow(userInput: string): Promise<string> {
+  const difyApiUrl = process.env.DIFY_API_URL;
+  const difyApiKey = process.env.DIFY_API_KEY;
+  const workflowId = process.env.DIFY_WORKFLOW_ID;
+
+  if (!difyApiUrl || !difyApiKey || !workflowId) {
+    throw new Error('Dify configuration is missing');
+  }
+
+  // Dify APIのエンドポイント構築
+  // DIFY_API_VERSIONが設定されている場合: /v1/workflows/{workflow_id}/run
+  // 設定されていない場合（空文字列）: /workflows/{workflow_id}/run
+  const apiVersion = process.env.DIFY_API_VERSION;
+  let endpoint: string;
+  
+  if (apiVersion && apiVersion.trim() !== '') {
+    // APIバージョンが指定されている場合
+    endpoint = `${difyApiUrl}/${apiVersion}/workflows/${workflowId}/run`;
+  } else {
+    // APIバージョンが指定されていない場合（デフォルト）
+    endpoint = `${difyApiUrl}/v1/workflows/${workflowId}/run`;
+  }
+
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${difyApiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      inputs: {
+        query: userInput,
+      },
+      response_mode: 'blocking',
+      user: 'slack-bot',
+    }),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Dify API error: ${response.status} - ${errorText}`);
+  }
+
+  const data = await response.json();
+  
+  // Difyのレスポンス構造に応じて調整
+  // 一般的なレスポンス構造: { answer: "...", data: {...} }
+  if (data.answer) {
+    return data.answer;
+  }
+  if (data.data && data.data.outputs) {
+    // ワークフローの出力から回答を取得
+    const outputs = data.data.outputs;
+    return outputs.answer || outputs.text || JSON.stringify(outputs);
+  }
+  if (data.output) {
+    return data.output;
+  }
+  
+  // フォールバック: レスポンス全体を文字列化
+  console.warn('Unexpected Dify API response structure:', JSON.stringify(data));
+  return JSON.stringify(data);
+}
+
+// Slackにメッセージを投稿する関数
+async function postSlackMessage(
+  channel: string,
+  text: string,
+  threadTs?: string
+): Promise<void> {
+  const slackBotToken = process.env.SLACK_BOT_TOKEN;
+
+  if (!slackBotToken) {
+    throw new Error('SLACK_BOT_TOKEN is not set');
+  }
+
+  const payload: {
+    channel: string;
+    text: string;
+    thread_ts?: string;
+  } = {
+    channel,
+    text,
+  };
+
+  if (threadTs) {
+    payload.thread_ts = threadTs;
+  }
+
+  const response = await fetch('https://slack.com/api/chat.postMessage', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${slackBotToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Slack API error: ${response.status} - ${errorText}`);
+  }
+
+  const data = await response.json();
+  if (!data.ok) {
+    throw new Error(`Slack API error: ${data.error}`);
+  }
+}
+
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   // POSTメソッドのみ受け付ける
   if (req.method !== 'POST') {
@@ -89,10 +199,70 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     // Bot がメンションされた場合の処理
     if (event && event.type === 'app_mention') {
-      // Dify API呼び出しなどをここで実行する
-      console.log('App mention received:', event);
+      // Bot自身のメッセージは無視
+      if (event.subtype === 'bot_message') {
+        return res.status(200).end();
+      }
+
+      // SlackのイベントAPIは3秒以内に応答する必要があるため、
+      // 先に200を返してからバックグラウンドで処理を実行
+      res.status(200).end();
+
+      // バックグラウンドでDify APIを呼び出し、結果をSlackに投稿
+      (async () => {
+        try {
+          // メンション部分を除去してメッセージテキストを取得
+          const messageText = event.text
+            .replace(/<@[A-Z0-9]+>/g, '') // メンションを除去
+            .trim();
+
+          if (!messageText) {
+            await postSlackMessage(
+              event.channel,
+              'メッセージが空です。質問を入力してください。',
+              event.ts
+            );
+            return;
+          }
+
+          console.log('Processing app mention:', {
+            channel: event.channel,
+            user: event.user,
+            text: messageText,
+          });
+
+          // Dify APIを呼び出し
+          const difyResponse = await callDifyWorkflow(messageText);
+
+          // Slackに結果を投稿（スレッドで返信）
+          await postSlackMessage(
+            event.channel,
+            difyResponse,
+            event.ts
+          );
+
+          console.log('Successfully processed app mention');
+        } catch (error) {
+          console.error('Error processing app mention:', error);
+          
+          // エラーをSlackに通知
+          try {
+            await postSlackMessage(
+              event.channel,
+              `エラーが発生しました: ${error instanceof Error ? error.message : 'Unknown error'}`,
+              event.ts
+            );
+          } catch (slackError) {
+            console.error('Failed to post error message to Slack:', slackError);
+          }
+        }
+      })();
+
+      // バックグラウンド処理を開始したので、ここでreturn
+      return;
     }
 
+    // その他のイベントタイプは正常に受け取ったことを返す
     res.status(200).end();
   } catch (error) {
     console.error('Error processing Slack event:', error);
