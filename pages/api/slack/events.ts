@@ -29,8 +29,21 @@ async function callDifyWorkflow(userInput: string): Promise<string> {
   const difyApiKey = process.env.DIFY_API_KEY;
   const workflowId = process.env.DIFY_WORKFLOW_ID;
 
-  if (!difyApiUrl || !difyApiKey || !workflowId) {
-    throw new Error('Dify configuration is missing');
+  // 環境変数のチェック（デバッグ用に詳細なエラーメッセージを出力）
+  const missingVars: string[] = [];
+  if (!difyApiUrl) missingVars.push('DIFY_API_URL');
+  if (!difyApiKey) missingVars.push('DIFY_API_KEY');
+  if (!workflowId) missingVars.push('DIFY_WORKFLOW_ID');
+
+  if (missingVars.length > 0) {
+    const errorMsg = `Dify configuration is missing. Missing environment variables: ${missingVars.join(', ')}`;
+    console.error(errorMsg);
+    console.error('Environment variables check:', {
+      DIFY_API_URL: difyApiUrl ? `${difyApiUrl.substring(0, 20)}...` : 'NOT SET',
+      DIFY_API_KEY: difyApiKey ? `${difyApiKey.substring(0, 10)}...` : 'NOT SET',
+      DIFY_WORKFLOW_ID: workflowId ? `${workflowId.substring(0, 10)}...` : 'NOT SET',
+    });
+    throw new Error(errorMsg);
   }
 
   // Dify APIのエンドポイント構築
@@ -47,24 +60,38 @@ async function callDifyWorkflow(userInput: string): Promise<string> {
     endpoint = `${difyApiUrl}/v1/workflows/${workflowId}/run`;
   }
 
+  console.log('Calling Dify API:', {
+    endpoint,
+    workflowId,
+    userInputLength: userInput.length,
+  });
+
+  const requestBody = {
+    inputs: {
+      query: userInput,
+    },
+    response_mode: 'blocking',
+    user: 'slack-bot',
+  };
+
   const response = await fetch(endpoint, {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${difyApiKey}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({
-      inputs: {
-        query: userInput,
-      },
-      response_mode: 'blocking',
-      user: 'slack-bot',
-    }),
+    body: JSON.stringify(requestBody),
   });
 
   if (!response.ok) {
     const errorText = await response.text();
-    throw new Error(`Dify API error: ${response.status} - ${errorText}`);
+    console.error('Dify API error:', {
+      status: response.status,
+      statusText: response.statusText,
+      endpoint,
+      errorText,
+    });
+    throw new Error(`Dify API error: ${response.status} ${response.statusText} - ${errorText}`);
   }
 
   const data = await response.json();
@@ -247,9 +274,31 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
           
           // エラーをSlackに通知
           try {
+            let errorMessage = 'エラーが発生しました。';
+            
+            if (error instanceof Error) {
+              // 環境変数が不足している場合のメッセージ
+              if (error.message.includes('Dify configuration is missing')) {
+                errorMessage = `❌ Difyの設定が不足しています。\n\n` +
+                  `Vercelの環境変数に以下が設定されているか確認してください：\n` +
+                  `• DIFY_API_URL\n` +
+                  `• DIFY_API_KEY\n` +
+                  `• DIFY_WORKFLOW_ID\n\n` +
+                  `詳細はVercelのログを確認してください。`;
+              } else if (error.message.includes('Dify API error')) {
+                errorMessage = `❌ Dify APIでエラーが発生しました。\n\n` +
+                  `${error.message}\n\n` +
+                  `Vercelのログで詳細を確認してください。`;
+              } else {
+                errorMessage = `❌ ${error.message}`;
+              }
+            } else {
+              errorMessage += ' Unknown error';
+            }
+            
             await postSlackMessage(
               event.channel,
-              `エラーが発生しました: ${error instanceof Error ? error.message : 'Unknown error'}`,
+              errorMessage,
               event.ts
             );
           } catch (slackError) {
