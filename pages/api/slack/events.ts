@@ -31,10 +31,11 @@ async function callDifyWorkflow(userInput: string): Promise<string> {
   const workflowId = process.env.DIFY_WORKFLOW_ID;
 
   // 環境変数のチェック（デバッグ用に詳細なエラーメッセージを出力）
+  // workflow_idはオプション。APIキーが特定のアプリケーションに関連付けられている場合は不要
   const missingVars: string[] = [];
   if (!difyApiUrl) missingVars.push('DIFY_API_URL');
   if (!difyApiKey) missingVars.push('DIFY_API_KEY');
-  if (!workflowId) missingVars.push('DIFY_WORKFLOW_ID');
+  // workflow_idはオプションのため、チェックしない
 
   if (missingVars.length > 0) {
     const errorMsg = `Dify configuration is missing. Missing environment variables: ${missingVars.join(', ')}`;
@@ -42,10 +43,16 @@ async function callDifyWorkflow(userInput: string): Promise<string> {
     console.error('Environment variables check:', {
       DIFY_API_URL: difyApiUrl ? `${difyApiUrl.substring(0, 20)}...` : 'NOT SET',
       DIFY_API_KEY: difyApiKey ? `${difyApiKey.substring(0, 10)}...` : 'NOT SET',
-      DIFY_WORKFLOW_ID: workflowId ? `${workflowId.substring(0, 10)}...` : 'NOT SET',
+      DIFY_WORKFLOW_ID: workflowId ? `${workflowId.substring(0, 10)}...` : 'NOT SET (optional)',
     });
     throw new Error(errorMsg);
   }
+  
+  console.log('Dify configuration check:', {
+    DIFY_API_URL: difyApiUrl ? `${difyApiUrl.substring(0, 20)}...` : 'NOT SET',
+    DIFY_API_KEY: difyApiKey ? `${difyApiKey.substring(0, 10)}...` : 'NOT SET',
+    DIFY_WORKFLOW_ID: workflowId ? `${workflowId.substring(0, 10)}...` : 'NOT SET (will use API key only)',
+  });
 
   // Dify APIのエンドポイント構築
   // ドキュメントによると、チャットアプリAPIは /chat-messages エンドポイントを使用
@@ -95,10 +102,13 @@ async function callDifyWorkflow(userInput: string): Promise<string> {
   };
   
   // workflow_idが指定されている場合のみリクエストボディに含める
-  // APIキーが特定のアプリケーションに関連付けられている場合は、workflow_idは不要
-  if (workflowId) {
-    requestBody.workflow_id = workflowId;
-  }
+  // チャットフローの場合、APIキーがアプリに関連付けられているため、workflow_idを指定するとエラーになる可能性がある
+  // そのため、workflow_idは指定しない（APIキーだけでアプリを識別）
+  // 注意: 複数のアプリケーションで同じAPIキーを使用する場合は、workflow_idが必要になる可能性がある
+  // 現在のエラー（Workflow not found）を回避するため、workflow_idは含めない
+  // if (workflowId) {
+  //   requestBody.workflow_id = workflowId;
+  // }
   
   console.log('Request body structure:', {
     hasQuery: !!requestBody.query,
