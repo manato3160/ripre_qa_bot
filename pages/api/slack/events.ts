@@ -1,5 +1,6 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
 import * as crypto from 'crypto';
+import { waitUntil } from '@vercel/functions';
 
 export const config = {
     api: {
@@ -102,10 +103,10 @@ async function callDifyWorkflow(userInput: string): Promise<string> {
   let response: Response;
   const startTime = Date.now();
   
-  // タイムアウト設定（20秒）- Vercelのサーバーレス関数の制限を考慮
+  // タイムアウト設定（8秒）- Vercelのサーバーレス関数の制限を考慮
   // Vercelの無料プランでは10秒、Proプランでも60秒の制限があるため、余裕を持たせる
   // バックグラウンド処理が完了する前にタイムアウトしないように短めに設定
-  const TIMEOUT_MS = 20000;
+  const TIMEOUT_MS = 8000;
   const controller = new AbortController();
   let timeoutFired = false;
   const timeoutId = setTimeout(() => {
@@ -143,7 +144,7 @@ async function callDifyWorkflow(userInput: string): Promise<string> {
     
     let fetchCompleted = false;
     try {
-      // fetchを実行（AbortControllerでタイムアウト制御）
+      // fetchを実行（AbortControllerとPromise.raceでタイムアウト制御）
       console.log('Executing fetch...', {
         endpoint,
         method: 'POST',
@@ -151,7 +152,8 @@ async function callDifyWorkflow(userInput: string): Promise<string> {
         bodySize: JSON.stringify(requestBody).length,
       });
       
-      response = await fetch(endpoint, {
+      // fetch Promise
+      const fetchPromise = fetch(endpoint, {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${difyApiKey}`,
@@ -160,6 +162,16 @@ async function callDifyWorkflow(userInput: string): Promise<string> {
         body: JSON.stringify(requestBody),
         signal: controller.signal,
       });
+
+      // タイムアウト用のPromise
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        setTimeout(() => {
+          reject(new Error(`Fetch timeout after ${TIMEOUT_MS}ms`));
+        }, TIMEOUT_MS);
+      });
+
+      // Promise.raceを使用して、fetchとタイムアウトのどちらかが先に完了するまで待つ
+      response = await Promise.race([fetchPromise, timeoutPromise]);
       
       fetchCompleted = true;
       console.log('Fetch promise resolved', {
@@ -239,14 +251,48 @@ async function callDifyWorkflow(userInput: string): Promise<string> {
   });
 
   if (!response.ok) {
-    const errorText = await response.text();
+    let errorText: string;
+    let errorData: any;
+    try {
+      errorText = await response.text();
+      try {
+        errorData = JSON.parse(errorText);
+      } catch {
+        // JSONパースに失敗した場合は、テキストのまま使用
+        errorData = { message: errorText };
+      }
+    } catch (err) {
+      errorText = 'Failed to read error response';
+      errorData = { message: errorText };
+    }
+
+    // Dify APIのエラーコードを確認
+    const errorCode = errorData?.code || errorData?.error_code;
+    const errorMessage = errorData?.message || errorText;
+
     console.error('Dify API error:', {
       status: response.status,
       statusText: response.statusText,
       endpoint,
+      errorCode,
+      errorMessage,
       errorText,
+      errorData,
     });
-    throw new Error(`Dify API error: ${response.status} ${response.statusText} - ${errorText}`);
+
+    // Dify APIのエラーコードに応じたエラーメッセージを生成
+    let userFriendlyError: string;
+    if (errorCode === 'workflow_not_found') {
+      userFriendlyError = `Dify API error: 指定されたワークフローバージョンが見つかりません (workflow_id: ${workflowId})`;
+    } else if (errorCode === 'workflow_id_format_error') {
+      userFriendlyError = `Dify API error: ワークフローID形式エラー、UUID形式が必要です (workflow_id: ${workflowId})`;
+    } else if (errorCode === 'completion_request_error') {
+      userFriendlyError = `Dify API error: テキスト生成に失敗しました`;
+    } else {
+      userFriendlyError = `Dify API error: ${response.status} ${response.statusText} - ${errorMessage}`;
+    }
+
+    throw new Error(userFriendlyError);
   }
 
   const data = await response.json();
@@ -408,7 +454,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       console.log('Sent 200 response, starting background processing');
 
       // バックグラウンドでDify APIを呼び出し、結果をSlackに投稿
-      // 処理が中断されてもエラーを検出できるように、Promiseを明示的に処理
+      // waitUntil()を使用して、Vercelの実行時間制限内でバックグラウンド処理を実行
       const backgroundProcess = (async () => {
         const processStartTime = Date.now();
         try {
@@ -523,18 +569,10 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         }
       })();
 
-      // バックグラウンド処理の完了を待たずに、エラーが発生した場合に備えて
-      // タイムアウトを設定（30秒後にエラーメッセージを送信）
-      setTimeout(async () => {
-        try {
-          // バックグラウンド処理がまだ実行中かどうかを確認する方法がないため、
-          // このタイムアウトは最後の手段として使用
-          // 実際には、バックグラウンド処理内のエラーハンドリングで処理されるはず
-          console.warn('Background process timeout check - this should not be reached if process completed');
-        } catch (err) {
-          console.error('Error in timeout handler:', err);
-        }
-      }, 30000);
+      // waitUntil()を使用して、Vercelの実行時間制限内でバックグラウンド処理を実行
+      // Next.jsのAPI Routesでは、waitUntil()はresオブジェクトから取得する必要がある可能性があるが、
+      // @vercel/functionsから直接インポートしたwaitUntil()を使用
+      waitUntil(backgroundProcess);
 
       // バックグラウンド処理を開始したので、ここでreturn
       return;
