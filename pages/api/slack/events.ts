@@ -76,13 +76,22 @@ async function callDifyWorkflow(userInput: string): Promise<string> {
     userInputLength: userInput.length,
   });
 
+  // Difyのワークフローの入力ノード名を環境変数から取得（デフォルト: query）
+  // ワークフローによっては text, question, input など異なる名前の場合がある
+  const inputNodeName = process.env.DIFY_INPUT_NODE_NAME || 'query';
+  
   const requestBody = {
     inputs: {
-      query: userInput,
+      [inputNodeName]: userInput,
     },
     response_mode: 'blocking',
     user: 'slack-bot',
   };
+  
+  console.log('Request body structure:', {
+    inputNodeName,
+    inputsKeys: Object.keys(requestBody.inputs),
+  });
 
   console.log('Sending request to Dify API:', {
     endpoint,
@@ -92,15 +101,24 @@ async function callDifyWorkflow(userInput: string): Promise<string> {
 
   let response: Response;
   const startTime = Date.now();
-  try {
-    // タイムアウト設定（30秒）
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => {
-      console.error('Dify API request timeout - aborting after 30s');
-      controller.abort();
-    }, 30000);
+  
+  // タイムアウト設定（60秒）- Vercelのサーバーレス関数の制限を考慮
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => {
+    const elapsedTime = Date.now() - startTime;
+    console.error('Dify API request timeout - aborting after 60s', {
+      elapsedTime: `${elapsedTime}ms`,
+      endpoint,
+    });
+    controller.abort();
+  }, 60000);
 
-    console.log('Starting fetch request to Dify API...');
+  try {
+    console.log('Starting fetch request to Dify API...', {
+      endpoint,
+      timestamp: new Date().toISOString(),
+    });
+    
     response = await fetch(endpoint, {
       method: 'POST',
       headers: {
@@ -113,20 +131,36 @@ async function callDifyWorkflow(userInput: string): Promise<string> {
 
     clearTimeout(timeoutId);
     const elapsedTime = Date.now() - startTime;
-    console.log(`Fetch completed in ${elapsedTime}ms`);
+    console.log(`Fetch completed in ${elapsedTime}ms`, {
+      status: response.status,
+      statusText: response.statusText,
+    });
   } catch (fetchError) {
+    clearTimeout(timeoutId);
     const elapsedTime = Date.now() - startTime;
-    console.error('Dify API fetch error:', {
+    
+    // エラーの詳細をログに記録
+    const errorDetails = {
       error: fetchError,
       errorName: fetchError instanceof Error ? fetchError.name : 'Unknown',
       errorMessage: fetchError instanceof Error ? fetchError.message : 'Unknown error',
+      errorStack: fetchError instanceof Error ? fetchError.stack : undefined,
       elapsedTime: `${elapsedTime}ms`,
       endpoint,
-    });
+      timestamp: new Date().toISOString(),
+    };
+    
+    console.error('Dify API fetch error:', errorDetails);
     
     if (fetchError instanceof Error && fetchError.name === 'AbortError') {
-      throw new Error(`Dify API request timeout after ${elapsedTime}ms (30s limit)`);
+      throw new Error(`Dify API request timeout after ${elapsedTime}ms (60s limit)`);
     }
+    
+    // ネットワークエラーの場合
+    if (fetchError instanceof TypeError && fetchError.message.includes('fetch')) {
+      throw new Error(`Network error when calling Dify API: ${fetchError.message}`);
+    }
+    
     throw new Error(`Failed to call Dify API: ${fetchError instanceof Error ? fetchError.message : 'Unknown error'}`);
   }
 
