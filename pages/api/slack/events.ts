@@ -47,9 +47,9 @@ async function callDifyWorkflow(userInput: string): Promise<string> {
   }
 
   // Dify APIのエンドポイント構築
+  // ドキュメントによると、チャットアプリAPIは /chat-messages エンドポイントを使用
   // DIFY_API_URLに既にバージョンが含まれている場合（例: https://dify.aibase.buzz/v1）
   // と含まれていない場合（例: https://api.dify.ai）の両方に対応
-  // ここまで来た時点で、difyApiUrlは必ず設定されている（上でチェック済み）
   let baseUrl = difyApiUrl!.trim();
   
   // 末尾のスラッシュを除去
@@ -63,11 +63,11 @@ async function callDifyWorkflow(userInput: string): Promise<string> {
   let endpoint: string;
   if (hasVersionInUrl) {
     // 既にバージョンが含まれている場合（例: https://dify.aibase.buzz/v1）
-    endpoint = `${baseUrl}/workflows/${workflowId}/run`;
+    endpoint = `${baseUrl}/chat-messages`;
   } else {
     // バージョンが含まれていない場合
     const apiVersion = process.env.DIFY_API_VERSION || 'v1';
-    endpoint = `${baseUrl}/${apiVersion}/workflows/${workflowId}/run`;
+    endpoint = `${baseUrl}/${apiVersion}/chat-messages`;
   }
 
   console.log('Calling Dify API:', {
@@ -76,20 +76,20 @@ async function callDifyWorkflow(userInput: string): Promise<string> {
     userInputLength: userInput.length,
   });
 
-  // Difyのワークフローの入力ノード名を環境変数から取得（デフォルト: query）
-  // ワークフローによっては text, question, input など異なる名前の場合がある
-  const inputNodeName = process.env.DIFY_INPUT_NODE_NAME || 'query';
-  
+  // DifyのチャットアプリAPIのリクエストボディ形式
+  // ドキュメントによると、queryはトップレベルに配置し、inputsはオプション
+  // workflow_idはリクエストボディに含める（オプション）
   const requestBody = {
-    inputs: {
-      [inputNodeName]: userInput,
-    },
-    response_mode: 'blocking',
+    query: userInput,
+    inputs: {}, // カスタム入力フィールドがない場合は空オブジェクト
+    response_mode: 'blocking' as const,
     user: 'slack-bot',
+    workflow_id: workflowId, // ワークフローIDを指定
   };
   
   console.log('Request body structure:', {
-    inputNodeName,
+    hasQuery: !!requestBody.query,
+    hasWorkflowId: !!requestBody.workflow_id,
     inputsKeys: Object.keys(requestBody.inputs),
   });
 
@@ -117,8 +117,11 @@ async function callDifyWorkflow(userInput: string): Promise<string> {
     console.log('Starting fetch request to Dify API...', {
       endpoint,
       timestamp: new Date().toISOString(),
+      requestBodySize: JSON.stringify(requestBody).length,
     });
     
+    // fetchを実行（AbortControllerでタイムアウト制御）
+    const fetchStartTime = Date.now();
     response = await fetch(endpoint, {
       method: 'POST',
       headers: {
@@ -129,11 +132,14 @@ async function callDifyWorkflow(userInput: string): Promise<string> {
       signal: controller.signal,
     });
 
+    const fetchElapsedTime = Date.now() - fetchStartTime;
     clearTimeout(timeoutId);
-    const elapsedTime = Date.now() - startTime;
-    console.log(`Fetch completed in ${elapsedTime}ms`, {
+    const totalElapsedTime = Date.now() - startTime;
+    
+    console.log(`Fetch completed in ${fetchElapsedTime}ms (total: ${totalElapsedTime}ms)`, {
       status: response.status,
       statusText: response.statusText,
+      ok: response.ok,
     });
   } catch (fetchError) {
     clearTimeout(timeoutId);
@@ -184,52 +190,22 @@ async function callDifyWorkflow(userInput: string): Promise<string> {
   const data = await response.json();
   console.log('Dify API response data:', {
     hasAnswer: !!data.answer,
-    hasData: !!data.data,
-    hasOutput: !!data.output,
+    hasEvent: !!data.event,
+    hasMessageId: !!data.message_id,
+    hasConversationId: !!data.conversation_id,
     dataKeys: Object.keys(data),
-    responsePreview: JSON.stringify(data).substring(0, 200),
+    responsePreview: JSON.stringify(data).substring(0, 300),
   });
   
-  // Difyのレスポンス構造に応じて調整
-  // 一般的なレスポンス構造: { answer: "...", data: {...} }
+  // DifyのチャットアプリAPIのレスポンス構造
+  // blockingモードの場合、ChatCompletionResponseオブジェクトが返される
+  // answerフィールドに完全な応答内容が含まれる
   if (data.answer) {
-    console.log('Using data.answer');
+    console.log('Using data.answer from ChatCompletionResponse');
     return data.answer;
   }
-  if (data.data) {
-    // ワークフローの出力から回答を取得
-    if (data.data.outputs) {
-      const outputs = data.data.outputs;
-      console.log('Using data.data.outputs:', Object.keys(outputs));
-      // ワークフローの出力ノード名に応じて調整
-      // 一般的な出力ノード名: answer, text, result, output など
-      const answer = outputs.answer || outputs.text || outputs.result || outputs.output;
-      if (answer) {
-        return typeof answer === 'string' ? answer : JSON.stringify(answer);
-      }
-      // 出力がオブジェクトの場合、最初の文字列値を探す
-      for (const key in outputs) {
-        if (typeof outputs[key] === 'string' && outputs[key].trim()) {
-          console.log(`Using outputs.${key}`);
-          return outputs[key];
-        }
-      }
-      console.warn('No string value found in outputs:', outputs);
-      return JSON.stringify(outputs);
-    }
-    // data.dataが直接文字列の場合
-    if (typeof data.data === 'string') {
-      console.log('Using data.data as string');
-      return data.data;
-    }
-    console.warn('Unexpected data.data structure:', data.data);
-  }
-  if (data.output) {
-    console.log('Using data.output');
-    return typeof data.output === 'string' ? data.output : JSON.stringify(data.output);
-  }
   
-  // フォールバック: レスポンス全体を文字列化
+  // フォールバック: 予期しないレスポンス構造の場合
   console.warn('Unexpected Dify API response structure:', JSON.stringify(data));
   return JSON.stringify(data, null, 2);
 }
