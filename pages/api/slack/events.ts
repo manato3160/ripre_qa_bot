@@ -2,10 +2,10 @@ import type { NextApiRequest, NextApiResponse } from 'next';
 import * as crypto from 'crypto';
 
 export const config = {
-  api: {
-    bodyParser: false,
-  },
-};
+    api: {
+      bodyParser: false,
+    },
+  };  
 
 // リクエストボディを読み取るヘルパー関数
 function getRawBody(req: NextApiRequest): Promise<string> {
@@ -104,11 +104,14 @@ async function callDifyWorkflow(userInput: string): Promise<string> {
   
   // タイムアウト設定（60秒）- Vercelのサーバーレス関数の制限を考慮
   const controller = new AbortController();
+  let timeoutFired = false;
   const timeoutId = setTimeout(() => {
+    timeoutFired = true;
     const elapsedTime = Date.now() - startTime;
     console.error('Dify API request timeout - aborting after 60s', {
       elapsedTime: `${elapsedTime}ms`,
       endpoint,
+      timestamp: new Date().toISOString(),
     });
     controller.abort();
   }, 60000);
@@ -118,28 +121,51 @@ async function callDifyWorkflow(userInput: string): Promise<string> {
       endpoint,
       timestamp: new Date().toISOString(),
       requestBodySize: JSON.stringify(requestBody).length,
+      hasApiKey: !!difyApiKey,
+      apiKeyPrefix: difyApiKey ? difyApiKey.substring(0, 10) : 'NOT SET',
     });
     
     // fetchを実行（AbortControllerでタイムアウト制御）
     const fetchStartTime = Date.now();
-    response = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${difyApiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(requestBody),
-      signal: controller.signal,
-    });
+    
+    // 定期的にログを出力して進行状況を確認
+    const progressInterval = setInterval(() => {
+      const elapsed = Date.now() - fetchStartTime;
+      if (elapsed > 5000) { // 5秒経過後、10秒ごとにログを出力
+        console.log(`Fetch still in progress... ${elapsed}ms elapsed`);
+      }
+    }, 10000);
+    
+    try {
+      response = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${difyApiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(requestBody),
+        signal: controller.signal,
+      });
+    } finally {
+      clearInterval(progressInterval);
+    }
 
     const fetchElapsedTime = Date.now() - fetchStartTime;
     clearTimeout(timeoutId);
     const totalElapsedTime = Date.now() - startTime;
     
+    if (timeoutFired) {
+      console.error('Timeout was fired but fetch completed anyway', {
+        fetchElapsedTime: `${fetchElapsedTime}ms`,
+        totalElapsedTime: `${totalElapsedTime}ms`,
+      });
+    }
+    
     console.log(`Fetch completed in ${fetchElapsedTime}ms (total: ${totalElapsedTime}ms)`, {
       status: response.status,
       statusText: response.statusText,
       ok: response.ok,
+      headers: Object.fromEntries(response.headers.entries()),
     });
   } catch (fetchError) {
     clearTimeout(timeoutId);
@@ -154,6 +180,7 @@ async function callDifyWorkflow(userInput: string): Promise<string> {
       elapsedTime: `${elapsedTime}ms`,
       endpoint,
       timestamp: new Date().toISOString(),
+      timeoutFired,
     };
     
     console.error('Dify API fetch error:', errorDetails);
@@ -163,7 +190,7 @@ async function callDifyWorkflow(userInput: string): Promise<string> {
     }
     
     // ネットワークエラーの場合
-    if (fetchError instanceof TypeError && fetchError.message.includes('fetch')) {
+    if (fetchError instanceof TypeError) {
       throw new Error(`Network error when calling Dify API: ${fetchError.message}`);
     }
     
@@ -288,8 +315,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     }
 
     // 通常のイベントの場合、署名検証を実行
-    const timestamp = req.headers['x-slack-request-timestamp'] as string;
-    const signature = req.headers['x-slack-signature'] as string;
+  const timestamp = req.headers['x-slack-request-timestamp'] as string;
+  const signature = req.headers['x-slack-signature'] as string;
 
     if (!timestamp || !signature) {
       return res.status(401).json({ error: 'Missing required headers' });
@@ -305,18 +332,18 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     }
 
     const mySignature = `v0=` + crypto.createHmac('sha256', signingSecret)
-      .update(basestring, 'utf8')
-      .digest('hex');
+    .update(basestring, 'utf8')
+    .digest('hex');
 
-    if (mySignature !== signature) {
+  if (mySignature !== signature) {
       console.error('Signature verification failed', {
         expected: signature,
         calculated: mySignature,
       });
       return res.status(401).json({ error: 'Verification failed' });
-    }
+  }
 
-    // Event handling
+  // Event handling
     const event = body.event;
     
     console.log('Received Slack event:', {
@@ -326,7 +353,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       hasEvent: !!event,
     });
 
-    // Bot がメンションされた場合の処理
+  // Bot がメンションされた場合の処理
     if (event && event.type === 'app_mention') {
       console.log('App mention event detected:', {
         channel: event.channel,
