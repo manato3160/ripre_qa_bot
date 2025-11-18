@@ -84,13 +84,41 @@ async function callDifyWorkflow(userInput: string): Promise<string> {
     user: 'slack-bot',
   };
 
-  const response = await fetch(endpoint, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${difyApiKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(requestBody),
+  console.log('Sending request to Dify API:', {
+    endpoint,
+    requestBody: JSON.stringify(requestBody),
+  });
+
+  let response: Response;
+  try {
+    // タイムアウト設定（30秒）
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 30000);
+
+    response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${difyApiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(requestBody),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeoutId);
+  } catch (fetchError) {
+    if (fetchError instanceof Error && fetchError.name === 'AbortError') {
+      console.error('Dify API request timeout');
+      throw new Error('Dify API request timeout (30s)');
+    }
+    console.error('Dify API fetch error:', fetchError);
+    throw new Error(`Failed to call Dify API: ${fetchError instanceof Error ? fetchError.message : 'Unknown error'}`);
+  }
+
+  console.log('Dify API response received:', {
+    status: response.status,
+    statusText: response.statusText,
+    headers: Object.fromEntries(response.headers.entries()),
   });
 
   if (!response.ok) {
@@ -105,24 +133,56 @@ async function callDifyWorkflow(userInput: string): Promise<string> {
   }
 
   const data = await response.json();
+  console.log('Dify API response data:', {
+    hasAnswer: !!data.answer,
+    hasData: !!data.data,
+    hasOutput: !!data.output,
+    dataKeys: Object.keys(data),
+    responsePreview: JSON.stringify(data).substring(0, 200),
+  });
   
   // Difyのレスポンス構造に応じて調整
   // 一般的なレスポンス構造: { answer: "...", data: {...} }
   if (data.answer) {
+    console.log('Using data.answer');
     return data.answer;
   }
-  if (data.data && data.data.outputs) {
+  if (data.data) {
     // ワークフローの出力から回答を取得
-    const outputs = data.data.outputs;
-    return outputs.answer || outputs.text || JSON.stringify(outputs);
+    if (data.data.outputs) {
+      const outputs = data.data.outputs;
+      console.log('Using data.data.outputs:', Object.keys(outputs));
+      // ワークフローの出力ノード名に応じて調整
+      // 一般的な出力ノード名: answer, text, result, output など
+      const answer = outputs.answer || outputs.text || outputs.result || outputs.output;
+      if (answer) {
+        return typeof answer === 'string' ? answer : JSON.stringify(answer);
+      }
+      // 出力がオブジェクトの場合、最初の文字列値を探す
+      for (const key in outputs) {
+        if (typeof outputs[key] === 'string' && outputs[key].trim()) {
+          console.log(`Using outputs.${key}`);
+          return outputs[key];
+        }
+      }
+      console.warn('No string value found in outputs:', outputs);
+      return JSON.stringify(outputs);
+    }
+    // data.dataが直接文字列の場合
+    if (typeof data.data === 'string') {
+      console.log('Using data.data as string');
+      return data.data;
+    }
+    console.warn('Unexpected data.data structure:', data.data);
   }
   if (data.output) {
-    return data.output;
+    console.log('Using data.output');
+    return typeof data.output === 'string' ? data.output : JSON.stringify(data.output);
   }
   
   // フォールバック: レスポンス全体を文字列化
   console.warn('Unexpected Dify API response structure:', JSON.stringify(data));
-  return JSON.stringify(data);
+  return JSON.stringify(data, null, 2);
 }
 
 // Slackにメッセージを投稿する関数
