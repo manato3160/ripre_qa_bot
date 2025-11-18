@@ -79,19 +79,32 @@ async function callDifyWorkflow(userInput: string): Promise<string> {
 
   // DifyのチャットアプリAPIのリクエストボディ形式
   // ドキュメントによると、queryはトップレベルに配置し、inputsはオプション
-  // workflow_idはリクエストボディに含める（オプション）
-  const requestBody = {
+  // workflow_idはオプション。APIキーが特定のアプリケーションに関連付けられている場合は不要
+  // チャットフローの場合、APIキーがアプリに関連付けられているため、workflow_idは不要な可能性がある
+  const requestBody: {
+    query: string;
+    inputs: {};
+    response_mode: 'blocking';
+    user: string;
+    workflow_id?: string;
+  } = {
     query: userInput,
     inputs: {}, // カスタム入力フィールドがない場合は空オブジェクト
-    response_mode: 'blocking' as const,
+    response_mode: 'blocking',
     user: 'slack-bot',
-    workflow_id: workflowId, // ワークフローIDを指定
   };
+  
+  // workflow_idが指定されている場合のみリクエストボディに含める
+  // APIキーが特定のアプリケーションに関連付けられている場合は、workflow_idは不要
+  if (workflowId) {
+    requestBody.workflow_id = workflowId;
+  }
   
   console.log('Request body structure:', {
     hasQuery: !!requestBody.query,
     hasWorkflowId: !!requestBody.workflow_id,
     inputsKeys: Object.keys(requestBody.inputs),
+    workflowIdProvided: !!workflowId,
   });
 
   console.log('Sending request to Dify API:', {
@@ -282,8 +295,18 @@ async function callDifyWorkflow(userInput: string): Promise<string> {
 
     // Dify APIのエラーコードに応じたエラーメッセージを生成
     let userFriendlyError: string;
-    if (errorCode === 'workflow_not_found') {
-      userFriendlyError = `Dify API error: 指定されたワークフローバージョンが見つかりません (workflow_id: ${workflowId})`;
+    if (errorCode === 'not_found' || errorCode === 'workflow_not_found') {
+      // エラーメッセージにワークフローIDが含まれているか確認
+      if (errorMessage.includes('Workflow not found')) {
+        userFriendlyError = `Dify API error: ワークフローが見つかりません (workflow_id: ${workflowId})\n\n` +
+          `以下の可能性があります：\n` +
+          `• ワークフローIDが正しくない\n` +
+          `• ワークフローが公開されていない\n` +
+          `• APIキーがそのワークフローにアクセスする権限がない\n` +
+          `• ワークフローが削除されている`;
+      } else {
+        userFriendlyError = `Dify API error: 指定されたワークフローバージョンが見つかりません (workflow_id: ${workflowId})`;
+      }
     } else if (errorCode === 'workflow_id_format_error') {
       userFriendlyError = `Dify API error: ワークフローID形式エラー、UUID形式が必要です (workflow_id: ${workflowId})`;
     } else if (errorCode === 'completion_request_error') {
