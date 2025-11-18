@@ -355,12 +355,19 @@ async function callDifyWorkflow(userInput: string): Promise<string> {
 async function postSlackMessage(
   channel: string,
   text: string,
-  threadTs?: string
+  threadTs?: string,
+  userId?: string
 ): Promise<void> {
   const slackBotToken = process.env.SLACK_BOT_TOKEN;
 
   if (!slackBotToken) {
     throw new Error('SLACK_BOT_TOKEN is not set');
+  }
+
+  // 質問者をメンションする場合、メッセージの先頭にメンションを追加
+  let messageText = text;
+  if (userId) {
+    messageText = `<@${userId}> ${text}`;
   }
 
   const payload: {
@@ -369,7 +376,7 @@ async function postSlackMessage(
     thread_ts?: string;
   } = {
     channel,
-    text,
+    text: messageText,
   };
 
   if (threadTs) {
@@ -506,7 +513,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
             await postSlackMessage(
               event.channel,
               'メッセージが空です。質問を入力してください。',
-              event.ts
+              event.ts,
+              event.user
             );
             return;
           }
@@ -522,11 +530,12 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
           const difyResponse = await callDifyWorkflow(messageText);
           console.log('Dify API call completed, response length:', difyResponse.length);
 
-          // Slackに結果を投稿（スレッドで返信）
+          // Slackに結果を投稿（スレッドで返信、質問者をメンション）
           await postSlackMessage(
             event.channel,
             difyResponse,
-            event.ts
+            event.ts,
+            event.user
           );
 
           const processElapsedTime = Date.now() - processStartTime;
@@ -581,12 +590,13 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
             errorMessage += ' Unknown error';
           }
           
-          // Slackへのエラーメッセージ送信を試みる（失敗してもログに記録）
+          // Slackへのエラーメッセージ送信を試みる（失敗してもログに記録、質問者をメンション）
           try {
             await postSlackMessage(
               event.channel,
               errorMessage,
-              event.ts
+              event.ts,
+              event.user
             );
             console.log('Error message sent to Slack successfully');
           } catch (slackError) {
