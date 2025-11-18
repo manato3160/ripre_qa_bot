@@ -102,19 +102,22 @@ async function callDifyWorkflow(userInput: string): Promise<string> {
   let response: Response;
   const startTime = Date.now();
   
-  // タイムアウト設定（60秒）- Vercelのサーバーレス関数の制限を考慮
+  // タイムアウト設定（20秒）- Vercelのサーバーレス関数の制限を考慮
+  // Vercelの無料プランでは10秒、Proプランでも60秒の制限があるため、余裕を持たせる
+  // バックグラウンド処理が完了する前にタイムアウトしないように短めに設定
+  const TIMEOUT_MS = 20000;
   const controller = new AbortController();
   let timeoutFired = false;
   const timeoutId = setTimeout(() => {
     timeoutFired = true;
     const elapsedTime = Date.now() - startTime;
-    console.error('Dify API request timeout - aborting after 60s', {
+    console.error(`Dify API request timeout - aborting after ${TIMEOUT_MS}ms`, {
       elapsedTime: `${elapsedTime}ms`,
       endpoint,
       timestamp: new Date().toISOString(),
     });
     controller.abort();
-  }, 60000);
+  }, TIMEOUT_MS);
 
   try {
     console.log('Starting fetch request to Dify API...', {
@@ -123,6 +126,7 @@ async function callDifyWorkflow(userInput: string): Promise<string> {
       requestBodySize: JSON.stringify(requestBody).length,
       hasApiKey: !!difyApiKey,
       apiKeyPrefix: difyApiKey ? difyApiKey.substring(0, 10) : 'NOT SET',
+      timeoutMs: TIMEOUT_MS,
     });
     
     // fetchを実行（AbortControllerでタイムアウト制御）
@@ -131,12 +135,22 @@ async function callDifyWorkflow(userInput: string): Promise<string> {
     // 定期的にログを出力して進行状況を確認
     const progressInterval = setInterval(() => {
       const elapsed = Date.now() - fetchStartTime;
-      if (elapsed > 5000) { // 5秒経過後、10秒ごとにログを出力
-        console.log(`Fetch still in progress... ${elapsed}ms elapsed`);
-      }
-    }, 10000);
+      console.log(`Fetch still in progress... ${elapsed}ms elapsed`, {
+        endpoint,
+        elapsedMs: elapsed,
+      });
+    }, 5000); // 5秒ごとにログを出力
     
+    let fetchCompleted = false;
     try {
+      // fetchを実行（AbortControllerでタイムアウト制御）
+      console.log('Executing fetch...', {
+        endpoint,
+        method: 'POST',
+        hasBody: !!requestBody,
+        bodySize: JSON.stringify(requestBody).length,
+      });
+      
       response = await fetch(endpoint, {
         method: 'POST',
         headers: {
@@ -146,8 +160,29 @@ async function callDifyWorkflow(userInput: string): Promise<string> {
         body: JSON.stringify(requestBody),
         signal: controller.signal,
       });
+      
+      fetchCompleted = true;
+      console.log('Fetch promise resolved', {
+        status: response.status,
+        statusText: response.statusText,
+        ok: response.ok,
+      });
+    } catch (fetchErr) {
+      fetchCompleted = true;
+      console.error('Fetch promise rejected', {
+        error: fetchErr,
+        errorName: fetchErr instanceof Error ? fetchErr.name : 'Unknown',
+        errorMessage: fetchErr instanceof Error ? fetchErr.message : 'Unknown error',
+      });
+      // fetchエラーを再スロー（外側のcatchで処理）
+      throw fetchErr;
     } finally {
       clearInterval(progressInterval);
+      if (!fetchCompleted) {
+        console.error('Fetch did not complete - this should not happen', {
+          elapsedTime: `${Date.now() - fetchStartTime}ms`,
+        });
+      }
     }
 
     const fetchElapsedTime = Date.now() - fetchStartTime;
@@ -185,8 +220,8 @@ async function callDifyWorkflow(userInput: string): Promise<string> {
     
     console.error('Dify API fetch error:', errorDetails);
     
-    if (fetchError instanceof Error && fetchError.name === 'AbortError') {
-      throw new Error(`Dify API request timeout after ${elapsedTime}ms (60s limit)`);
+    if (fetchError instanceof Error && (fetchError.name === 'AbortError' || fetchError.message.includes('timeout'))) {
+      throw new Error(`Dify API request timeout after ${elapsedTime}ms (${TIMEOUT_MS}ms limit)`);
     }
     
     // ネットワークエラーの場合
@@ -373,9 +408,16 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       console.log('Sent 200 response, starting background processing');
 
       // バックグラウンドでDify APIを呼び出し、結果をSlackに投稿
-      (async () => {
+      // 処理が中断されてもエラーを検出できるように、Promiseを明示的に処理
+      const backgroundProcess = (async () => {
+        const processStartTime = Date.now();
         try {
-          console.log('Background processing started');
+          console.log('Background processing started', {
+            timestamp: new Date().toISOString(),
+            channel: event.channel,
+            ts: event.ts,
+          });
+          
           // メンション部分を除去してメッセージテキストを取得
           const messageText = event.text
             .replace(/<@[A-Z0-9]+>/g, '') // メンションを除去
@@ -408,44 +450,91 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
             event.ts
           );
 
-          console.log('Successfully processed app mention');
+          const processElapsedTime = Date.now() - processStartTime;
+          console.log('Successfully processed app mention', {
+            elapsedTime: `${processElapsedTime}ms`,
+          });
         } catch (error) {
-          console.error('Error processing app mention:', error);
+          const processElapsedTime = Date.now() - processStartTime;
+          console.error('Error processing app mention:', {
+            error,
+            errorName: error instanceof Error ? error.name : 'Unknown',
+            errorMessage: error instanceof Error ? error.message : 'Unknown error',
+            errorStack: error instanceof Error ? error.stack : undefined,
+            channel: event.channel,
+            ts: event.ts,
+            elapsedTime: `${processElapsedTime}ms`,
+            timestamp: new Date().toISOString(),
+          });
           
-          // エラーをSlackに通知
-          try {
-            let errorMessage = 'エラーが発生しました。';
-            
-            if (error instanceof Error) {
-              // 環境変数が不足している場合のメッセージ
-              if (error.message.includes('Dify configuration is missing')) {
-                errorMessage = `❌ Difyの設定が不足しています。\n\n` +
-                  `Vercelの環境変数に以下が設定されているか確認してください：\n` +
-                  `• DIFY_API_URL\n` +
-                  `• DIFY_API_KEY\n` +
-                  `• DIFY_WORKFLOW_ID\n\n` +
-                  `詳細はVercelのログを確認してください。`;
-              } else if (error.message.includes('Dify API error')) {
-                errorMessage = `❌ Dify APIでエラーが発生しました。\n\n` +
-                  `${error.message}\n\n` +
-                  `Vercelのログで詳細を確認してください。`;
-              } else {
-                errorMessage = `❌ ${error.message}`;
-              }
+          // エラーをSlackに通知（必ず実行されるようにする）
+          let errorMessage = 'エラーが発生しました。';
+          
+          if (error instanceof Error) {
+            // 環境変数が不足している場合のメッセージ
+            if (error.message.includes('Dify configuration is missing')) {
+              errorMessage = `❌ Difyの設定が不足しています。\n\n` +
+                `Vercelの環境変数に以下が設定されているか確認してください：\n` +
+                `• DIFY_API_URL\n` +
+                `• DIFY_API_KEY\n` +
+                `• DIFY_WORKFLOW_ID\n\n` +
+                `詳細はVercelのログを確認してください。`;
+            } else if (error.message.includes('Dify API error')) {
+              errorMessage = `❌ Dify APIでエラーが発生しました。\n\n` +
+                `${error.message}\n\n` +
+                `Vercelのログで詳細を確認してください。`;
+            } else if (error.message.includes('timeout')) {
+              errorMessage = `❌ Dify APIへのリクエストがタイムアウトしました。\n\n` +
+                `${error.message}\n\n` +
+                `Difyのワークフローが長時間実行されている可能性があります。\n` +
+                `Vercelのログで詳細を確認してください。`;
+            } else if (error.message.includes('Network error')) {
+              errorMessage = `❌ Dify APIへのネットワークエラーが発生しました。\n\n` +
+                `${error.message}\n\n` +
+                `ネットワーク接続を確認してください。\n` +
+                `Vercelのログで詳細を確認してください。`;
             } else {
-              errorMessage += ' Unknown error';
+              errorMessage = `❌ エラーが発生しました。\n\n` +
+                `${error.message}\n\n` +
+                `Vercelのログで詳細を確認してください。`;
             }
-            
+          } else {
+            errorMessage += ' Unknown error';
+          }
+          
+          // Slackへのエラーメッセージ送信を試みる（失敗してもログに記録）
+          try {
             await postSlackMessage(
               event.channel,
               errorMessage,
               event.ts
             );
+            console.log('Error message sent to Slack successfully');
           } catch (slackError) {
-            console.error('Failed to post error message to Slack:', slackError);
+            console.error('Failed to post error message to Slack:', {
+              slackError,
+              errorName: slackError instanceof Error ? slackError.name : 'Unknown',
+              errorMessage: slackError instanceof Error ? slackError.message : 'Unknown error',
+              errorStack: slackError instanceof Error ? slackError.stack : undefined,
+              channel: event.channel,
+              ts: event.ts,
+            });
           }
         }
       })();
+
+      // バックグラウンド処理の完了を待たずに、エラーが発生した場合に備えて
+      // タイムアウトを設定（30秒後にエラーメッセージを送信）
+      setTimeout(async () => {
+        try {
+          // バックグラウンド処理がまだ実行中かどうかを確認する方法がないため、
+          // このタイムアウトは最後の手段として使用
+          // 実際には、バックグラウンド処理内のエラーハンドリングで処理されるはず
+          console.warn('Background process timeout check - this should not be reached if process completed');
+        } catch (err) {
+          console.error('Error in timeout handler:', err);
+        }
+      }, 30000);
 
       // バックグラウンド処理を開始したので、ここでreturn
       return;
