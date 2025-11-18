@@ -87,14 +87,20 @@ async function callDifyWorkflow(userInput: string): Promise<string> {
   console.log('Sending request to Dify API:', {
     endpoint,
     requestBody: JSON.stringify(requestBody),
+    timestamp: new Date().toISOString(),
   });
 
   let response: Response;
+  const startTime = Date.now();
   try {
     // タイムアウト設定（30秒）
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 30000);
+    const timeoutId = setTimeout(() => {
+      console.error('Dify API request timeout - aborting after 30s');
+      controller.abort();
+    }, 30000);
 
+    console.log('Starting fetch request to Dify API...');
     response = await fetch(endpoint, {
       method: 'POST',
       headers: {
@@ -106,12 +112,21 @@ async function callDifyWorkflow(userInput: string): Promise<string> {
     });
 
     clearTimeout(timeoutId);
+    const elapsedTime = Date.now() - startTime;
+    console.log(`Fetch completed in ${elapsedTime}ms`);
   } catch (fetchError) {
+    const elapsedTime = Date.now() - startTime;
+    console.error('Dify API fetch error:', {
+      error: fetchError,
+      errorName: fetchError instanceof Error ? fetchError.name : 'Unknown',
+      errorMessage: fetchError instanceof Error ? fetchError.message : 'Unknown error',
+      elapsedTime: `${elapsedTime}ms`,
+      endpoint,
+    });
+    
     if (fetchError instanceof Error && fetchError.name === 'AbortError') {
-      console.error('Dify API request timeout');
-      throw new Error('Dify API request timeout (30s)');
+      throw new Error(`Dify API request timeout after ${elapsedTime}ms (30s limit)`);
     }
-    console.error('Dify API fetch error:', fetchError);
     throw new Error(`Failed to call Dify API: ${fetchError instanceof Error ? fetchError.message : 'Unknown error'}`);
   }
 
@@ -345,7 +360,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
           });
 
           // Dify APIを呼び出し
+          console.log('About to call Dify API with message:', messageText.substring(0, 100));
           const difyResponse = await callDifyWorkflow(messageText);
+          console.log('Dify API call completed, response length:', difyResponse.length);
 
           // Slackに結果を投稿（スレッドで返信）
           await postSlackMessage(
