@@ -47,17 +47,27 @@ async function callDifyWorkflow(userInput: string): Promise<string> {
   }
 
   // Dify APIのエンドポイント構築
-  // DIFY_API_VERSIONが設定されている場合: /v1/workflows/{workflow_id}/run
-  // 設定されていない場合（空文字列）: /workflows/{workflow_id}/run
-  const apiVersion = process.env.DIFY_API_VERSION;
-  let endpoint: string;
+  // DIFY_API_URLに既にバージョンが含まれている場合（例: https://dify.aibase.buzz/v1）
+  // と含まれていない場合（例: https://api.dify.ai）の両方に対応
+  // ここまで来た時点で、difyApiUrlは必ず設定されている（上でチェック済み）
+  let baseUrl = difyApiUrl!.trim();
   
-  if (apiVersion && apiVersion.trim() !== '') {
-    // APIバージョンが指定されている場合
-    endpoint = `${difyApiUrl}/${apiVersion}/workflows/${workflowId}/run`;
+  // 末尾のスラッシュを除去
+  if (baseUrl.endsWith('/')) {
+    baseUrl = baseUrl.slice(0, -1);
+  }
+  
+  // DIFY_API_URLに既にバージョンが含まれているかチェック
+  const hasVersionInUrl = /\/v\d+$/.test(baseUrl);
+  
+  let endpoint: string;
+  if (hasVersionInUrl) {
+    // 既にバージョンが含まれている場合（例: https://dify.aibase.buzz/v1）
+    endpoint = `${baseUrl}/workflows/${workflowId}/run`;
   } else {
-    // APIバージョンが指定されていない場合（デフォルト）
-    endpoint = `${difyApiUrl}/v1/workflows/${workflowId}/run`;
+    // バージョンが含まれていない場合
+    const apiVersion = process.env.DIFY_API_VERSION || 'v1';
+    endpoint = `${baseUrl}/${apiVersion}/workflows/${workflowId}/run`;
   }
 
   console.log('Calling Dify API:', {
@@ -223,9 +233,22 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
     // Event handling
     const event = body.event;
+    
+    console.log('Received Slack event:', {
+      type: body.type,
+      eventType: event?.type,
+      eventSubtype: event?.subtype,
+      hasEvent: !!event,
+    });
 
     // Bot がメンションされた場合の処理
     if (event && event.type === 'app_mention') {
+      console.log('App mention event detected:', {
+        channel: event.channel,
+        user: event.user,
+        text: event.text,
+        ts: event.ts,
+      });
       // Bot自身のメッセージは無視
       if (event.subtype === 'bot_message') {
         return res.status(200).end();
@@ -234,10 +257,13 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       // SlackのイベントAPIは3秒以内に応答する必要があるため、
       // 先に200を返してからバックグラウンドで処理を実行
       res.status(200).end();
+      
+      console.log('Sent 200 response, starting background processing');
 
       // バックグラウンドでDify APIを呼び出し、結果をSlackに投稿
       (async () => {
         try {
+          console.log('Background processing started');
           // メンション部分を除去してメッセージテキストを取得
           const messageText = event.text
             .replace(/<@[A-Z0-9]+>/g, '') // メンションを除去
